@@ -116,13 +116,21 @@ ops/tooling, and data model.
 
 ## Frontend & backend
 
-### 8. Modern web frontend: React + TypeScript (Vite) SPA (was: Streamlit)
+### 8. Hosted web tier: React SPA + Cognito auth + CloudFront (was: local Streamlit, no auth, no hosting)
 
-- **What changed.** A React 18 + Vite SPA with Cognito OIDC auth, SSE streaming, and the HITL
-  approval UI.
-- **Why it's an improvement.** A real single-page app with proper auth and streaming UX,
-  deployable on S3 + CloudFront; it doubles as a reusable production reference.
-- **Where it lives.** `frontend/`.
+- **What changed.** A React 18 + Vite SPA with SSE streaming and the HITL approval UI. Two
+  pieces are **entirely new to v2**, not just a framework swap:
+  - **Auth.** Cognito OIDC issues a JWT that authorizes calls to the agent runtime
+    (admin-created users; self-registration disabled). v1 had *no auth at all* — it ran as a
+    local Streamlit app that talked directly to the runtime, auto-discovering the runtime ARN
+    from CloudFormation outputs.
+  - **Hosting.** The SPA is served from **S3 + CloudFront**. v1 had *no web hosting* — the UI
+    lived on your laptop via `streamlit run`, with no CloudFront distribution and no S3 site.
+- **Why it's an improvement.** A real, hosted single-page app with proper sign-in and
+  streaming UX; it doubles as a reusable production reference. The whole client/edge/auth tier
+  (SPA → S3 + CloudFront → Cognito OIDC/JWT → agent runtime) is a v2 addition.
+- **Where it lives.** `frontend/`, `cfn/template.yaml` (Cognito user pool + app client, S3
+  bucket, CloudFront distribution + OAC).
 
 ### 9. FastAPI + Strands backend on AgentCore Runtime (was: stdlib HTTP handler)
 
@@ -193,4 +201,4 @@ ops/tooling, and data model.
 
 - [`README.md`](./README.md) — quick reference table + Observability verification steps.
 - [`DECISIONS.md`](./DECISIONS.md) — ADRs with the deep rationale and trade-offs.
-- [`agentcore-threat-intel-engine/`](../agentcore-threat-intel-engine/) — v1, the original build.
+- v1 (`agentcore-threat-intel-engine`) — the original build this project rebuilds on.

@@ -30,9 +30,18 @@ version (v1) with a different retrieval store and a modern web stack.
 | Retrieval | Managed KB `Retrieve` | Own embed-query + `SearchVectors` |
 | Generation | Hand-rolled retrieve-then-generate | Agentic retrieve-then-generate (Strands) |
 | Web search | none | **AgentCore managed Web Search** (MCP gateway) |
-| Human-in-the-loop | none | **Approve profile enrichment** before write |
-| UI | Streamlit | **React + TypeScript (Vite)** SPA |
+| Human-in-the-loop | none | **Approve profile enrichment _and_ new-actor creation** before write |
+| Conversation memory | none | **AgentCore Memory**, per-analyst scoped by `{actorId}` |
+| Memory management | none | **HITL `clear_all_memory`** (approve to wipe), auto fresh-session restart |
+| Session control | none | **New Session** button to start a fresh conversation |
+| UI | local Streamlit app | **React + TypeScript (Vite)** SPA |
+| Auth | none (ran locally) | **Cognito OIDC / JWT** (admin-created users, self-signup off) |
+| Hosting | none (ran on your laptop) | **S3 + CloudFront** SPA hosting |
+| Response streaming | none | **SSE token streaming** (answer builds live in the UI) |
+| Response formatting | plain text | **live GitHub-Flavored Markdown** (headings, tables, code) |
 | Backend | stdlib HTTP handler | **FastAPI + Strands** on AgentCore Runtime |
+| Profile creation | none | **autonomous builder runtime** researches + writes new actors in the background |
+| Observability | none | **ADOT / OpenTelemetry** traces in CloudWatch GenAI Observability |
 | Metadata | in S3 Vectors only | first-class **DynamoDB attributes** |
 
 > For a consolidated, per-feature explanation of what improved and why (with source pointers), see [`ENHANCEMENTS.md`](./ENHANCEMENTS.md).
@@ -106,6 +115,13 @@ round-trip keeps the contract simple.
   UI updates smoothly rather than re-rendering per token, and each update is re-rendered as
   GitHub-Flavored Markdown via **react-markdown** + **remark-gfm** (which tolerate incomplete
   mid-stream markdown). Auth is **Cognito OIDC** via **oidc-client-ts**.
+
+**Readable, well-formatted answers.** Threat-intel responses are long and structured — actor
+overviews, TTP tables, MITRE technique lists, detection guidance, fenced code. Rendering them
+as live GitHub-Flavored Markdown (not a wall of plain text) means headings, tables, lists,
+links, and code blocks display properly *as the answer streams in*, so an analyst can scan and
+act on it quickly. This is new in v2 — v1's Streamlit UI showed plain text. See ENHANCEMENTS.md
+for the details.
 
 ## Data model (summary)
 
