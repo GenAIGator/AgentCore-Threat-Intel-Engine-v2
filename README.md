@@ -44,6 +44,12 @@ agent (Claude Sonnet 4.6). The agent's tools:
 
 ![High-level system flow](./docs/architecture-overview.png)
 
+The diagram above traces one request end to end: the browser SPA signs the user in with
+Cognito, POSTs their question to the runtime's `/invocations` endpoint, and the Strands agent
+decides which tools to call — grounding in the DynamoDB vector store, optionally searching the
+web, and writing back through the human-in-the-loop tools — before streaming a cited answer
+back to the UI. The agent's tools:
+
 - **`retrieve_profiles`** — embeds the query (Titan v2, 1024-dim) and runs `SearchVectors`
   over the DynamoDB vector index (COSINE, no HASH key, `FileType`/`Country` inline filters).
 - **`WebSearch`** — the AgentCore managed web-search connector via an MCP gateway.
@@ -59,8 +65,47 @@ Conversation continuity is backed by **AgentCore Memory** (short-term history pl
 long-term facts and preferences). The agent is cached per session in-process so the same
 instance that raised a HITL interrupt handles the approve/reject resume.
 
-Generation streams to the UI over **SSE**; the HITL approve/reject round-trip is a
-**synchronous** POST (no streaming).
+## Streaming: where SSE is used (and where it isn't)
+
+The app streams in one direction and stays synchronous in the other, on purpose.
+
+**Answer generation → Server-Sent Events (SSE).** When the agent generates an answer, the
+runtime returns a `text/event-stream` and pushes each incremental text delta as its own
+frame, so the analyst sees the response build token-by-token instead of waiting for the whole
+thing. The stream carries a small set of typed events and always ends with exactly one
+terminal frame:
+
+- `{"content": "..."}` — an incremental text delta (appended to the current message)
+- `{"tool_running": "enrich_profile", "notice": "..."}` — a transient "working…" hint while a
+  slow tool runs
+- `{"pending_approval": true, "interrupts": [...]}` — terminal: the agent hit a
+  human-in-the-loop interrupt and is waiting for approval
+- `{"done": true}` — terminal: the answer finished normally
+- `{"error": "..."}` — terminal: something failed, surfaced inline
+
+*Why SSE here:* generation is a long, one-way server→client push. SSE is the simplest fit —
+plain HTTP, no extra protocol, no bidirectional socket to manage — which is why we didn't
+reach for WebSockets.
+
+**HITL approve/reject → plain synchronous POST (no streaming).** When the analyst approves or
+rejects a proposed enrichment, the frontend sends a normal JSON `POST` to the same
+`/invocations` endpoint and waits for a single JSON response. *Why not SSE:* an approve/reject
+is one discrete decision with one result — there's nothing to stream, so a request/response
+round-trip keeps the contract simple.
+
+**What makes it work:**
+
+- *Backend* — FastAPI's `StreamingResponse` with `media_type="text/event-stream"`, fed by an
+  async generator (`stream_agent_response`) that iterates the Strands agent's `stream_async`
+  and formats each event as a `data: {json}\n\n` frame. On AgentCore Runtime, served by
+  uvicorn.
+- *Frontend* — **React 18 + TypeScript** on **Vite**. The client reads the stream with the
+  `fetch` API and a `ReadableStream` reader (`response.body.getReader()` + `TextDecoder`),
+  parsing frames as they arrive — not `EventSource`, because the request is a `POST` with an
+  auth header, which `EventSource` can't send. Deltas are coalesced in a ~30ms buffer so the
+  UI updates smoothly rather than re-rendering per token, and each update is re-rendered as
+  GitHub-Flavored Markdown via **react-markdown** + **remark-gfm** (which tolerate incomplete
+  mid-stream markdown). Auth is **Cognito OIDC** via **oidc-client-ts**.
 
 ## Data model (summary)
 
@@ -80,6 +125,22 @@ The four read/write flows — seed ingestion, retrieval, HITL enrichment, and au
 new-profile creation — all share this one vector store:
 
 ![DynamoDB vector RAG — four flows into one store](./docs/dynamodb-vector-rag.png)
+
+The diagram above shows all four paths converging on the single `ThreatProfilesV2` table.
+Every write embeds with the same Titan v2 model that retrieval embeds queries with, so stored
+and query vectors always live in the same space:
+
+- **Seed ingestion (write)** — the loader walks the `threat-profiles/` corpus, embeds each
+  shard, and upserts all items (see `loader/load_profiles.py`).
+- **Retrieval (read)** — `retrieve_profiles` embeds the analyst's query and runs
+  `SearchVectors` to pull the nearest shards as grounding context.
+- **HITL enrichment (write)** — `enrich_profile` researches an actor, and on analyst approval
+  overwrites a shard's content and re-embeds it in place.
+- **Autonomous creation (write)** — for a brand-new actor, the builder runtime generates all
+  12 sections, embeds them, and writes the whole profile in one batch.
+
+Retrieval reads what the other three flows write — there's no separate index to keep in sync,
+because the vector index is derived from the table itself.
 
 ## How embedding, search, and retrieval work
 
