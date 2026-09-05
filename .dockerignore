@@ -1,0 +1,17 @@
+# Keep the Docker build context small. The builder image uses the v2 ROOT as its
+# build context (to COPY shared modules from agent/src and loader/), so exclude
+# everything the image does not need.
+**/.venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.ruff_cache
+**/.mypy_cache
+.git
+frontend/node_modules
+frontend/dist
+docs
+temp
+*.md
+**/.env
+**/tests

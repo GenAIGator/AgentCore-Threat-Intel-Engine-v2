@@ -1,0 +1,143 @@
+/*
+ * Scoped styling for rendered assistant Markdown.
+ *
+ * EVERY selector is prefixed with `.md` so these rules only apply inside the
+ * <MarkdownMessage> wrapper and never leak into the rest of the app (which uses
+ * inline `styles` objects). The palette matches the existing light theme: blue
+ * accents (#1565c0), grey assistant bubble, subtle borders (#e0e0e0).
+ */
+
+.md {
+  color: #2e2e2e;
+  line-height: 1.55;
+  font-size: 0.95rem;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+
+/* Paragraph spacing — tight at the edges so bubbles aren't over-padded. */
+.md p {
+  margin: 0.5rem 0;
+}
+.md > :first-child {
+  margin-top: 0;
+}
+.md > :last-child {
+  margin-bottom: 0;
+}
+
+/* Heading hierarchy. */
+.md h1,
+.md h2,
+.md h3,
+.md h4,
+.md h5,
+.md h6 {
+  font-weight: 700;
+  line-height: 1.3;
+  margin: 1rem 0 0.5rem;
+}
+.md h1 { font-size: 1.4rem; }
+.md h2 { font-size: 1.25rem; }
+.md h3 { font-size: 1.1rem; }
+.md h4 { font-size: 1rem; }
+.md h5 { font-size: 0.9rem; }
+.md h6 { font-size: 0.85rem; color: #546e7a; }
+/* Subtle separator under the top two levels. */
+.md h1,
+.md h2 {
+  border-bottom: 1px solid #e0e0e0;
+  padding-bottom: 0.2rem;
+}
+
+/* Lists — clear indentation; nested lists tighter so nesting reads well. */
+.md ul,
+.md ol {
+  margin: 0.5rem 0;
+  padding-left: 1.5rem;
+}
+.md li {
+  margin: 0.25rem 0;
+}
+.md li > ul,
+.md li > ol {
+  margin: 0.2rem 0;
+}
+
+/* Tables (GFM). display:block + overflow-x lets wide tables scroll on small
+ * screens without breaking the bubble layout. */
+.md table {
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+  border-collapse: collapse;
+  margin: 0.75rem 0;
+  font-size: 0.9rem;
+}
+.md th,
+.md td {
+  border: 1px solid #ccc;
+  padding: 0.4rem 0.6rem;
+  text-align: left;
+}
+.md thead th {
+  background: #eef2f7;
+  font-weight: 700;
+}
+.md tbody tr:nth-child(even) {
+  background: #fafafa;
+}
+
+/* Blockquotes. */
+.md blockquote {
+  margin: 0.5rem 0;
+  padding: 0.25rem 0.9rem;
+  border-left: 3px solid #90caf9;
+  background: #f4f8fd;
+  color: #37474f;
+}
+.md blockquote > :first-child { margin-top: 0; }
+.md blockquote > :last-child { margin-bottom: 0; }
+
+/* Inline code (anything not inside a <pre>). */
+.md :not(pre) > code {
+  background: #eceff1;
+  padding: 0.1rem 0.35rem;
+  border-radius: 4px;
+  font-size: 0.85em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* Fenced code blocks — distinct dark container with horizontal scroll. */
+.md pre {
+  background: #263238;
+  color: #eceff1;
+  padding: 0.75rem 0.9rem;
+  border-radius: 6px;
+  overflow-x: auto;
+  margin: 0.75rem 0;
+  font-size: 0.85rem;
+  line-height: 1.4;
+}
+.md pre code {
+  background: none;
+  padding: 0;
+  color: inherit;
+  white-space: pre;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* Links — safe target/rel is set in the component. */
+.md a {
+  color: #1565c0;
+  text-decoration: underline;
+}
+
+.md img {
+  max-width: 100%;
+}
+.md hr {
+  border: none;
+  border-top: 1px solid #e0e0e0;
+  margin: 1rem 0;
+}

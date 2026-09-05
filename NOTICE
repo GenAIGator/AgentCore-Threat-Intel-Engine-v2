@@ -1,0 +1,47 @@
+Threat Intelligence Engine v2
+Copyright 2026 GenAI Gator
+
+This product is licensed under the Apache License, Version 2.0.
+
+This project includes the following third-party components:
+
+- Strands Agents SDK (https://github.com/strands-agents/sdk-python)
+  Licensed under the Apache License, Version 2.0
+  Used for the agentic retrieve-then-generate workflow and tool orchestration
+
+- Amazon Bedrock AgentCore SDK (bedrock-agentcore)
+  Licensed under the Apache License, Version 2.0
+  Used for AgentCore Runtime, Memory, and managed Web Search gateway integration
+
+- Boto3 / botocore (https://github.com/boto/boto3)
+  Licensed under the Apache License, Version 2.0
+  Used for AWS service interactions, including DynamoDB vector search
+  (SearchVectors) and Amazon Bedrock model invocation
+
+- FastAPI (https://github.com/fastapi/fastapi)
+  Licensed under the MIT License
+  Used for the agent's HTTP surface (/invocations, /ping) on AgentCore Runtime
+
+- Uvicorn (https://github.com/encode/uvicorn)
+  Licensed under the BSD 3-Clause License
+  Used as the ASGI server for the agent
+
+- React (https://github.com/facebook/react)
+  Licensed under the MIT License
+  Used for the single-page web frontend
+
+- Vite (https://github.com/vitejs/vite)
+  Licensed under the MIT License
+  Used to build and serve the frontend
+
+- AWS Distro for OpenTelemetry (aws-opentelemetry-distro)
+  Licensed under the Apache License, Version 2.0
+  Used for agent observability (traces/spans) on AgentCore Runtime
+
+This project uses Amazon Web Services (AWS) cloud infrastructure, including
+Amazon Bedrock (Claude Sonnet and Titan Text Embeddings), Amazon DynamoDB
+(vector search), Amazon Cognito, Amazon S3, and Amazon CloudFront.
+
+Portions of this project's content (including threat actor profiles,
+tabletop scenarios, and detection guidance) were generated with the
+assistance of artificial intelligence systems.

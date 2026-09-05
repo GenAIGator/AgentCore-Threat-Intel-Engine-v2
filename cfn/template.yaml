@@ -1,0 +1,757 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Threat Intelligence Engine v2 - full infrastructure: DynamoDB table (ThreatProfilesV2)
+  with a native vector index for ANN retrieval via SearchVectors; AgentCore Runtime
+  (JWT auth), Gateway + web-search target, and Memory; Cognito user pool + app client;
+  and S3 + CloudFront frontend hosting, with the runtime IAM execution role.
+
+# ---------------------------------------------------------------------------
+# Notes (kept out of the Description field, which is capped at 1024 chars):
+#
+# This template provisions the full v2 stack: the DynamoDB vector table (task 4.1),
+# plus (task 12) the AgentCore Runtime (JWT auth), Gateway + GatewayTarget (web-search),
+# Memory, the Cognito user pool + app client, S3 + CloudFront frontend hosting, and the
+# runtime IAM execution role.
+#
+# Data model (see design.md "Data model"):
+#   - Composite primary key: ProfileId (HASH) + ShardId (RANGE), both String.
+#       ProfileId = actor id (e.g. "0ktapus"); ShardId = shard file_type
+#       (e.g. "detection", "ai_tooling"). Query(ProfileId) returns all shards of an
+#       actor; GetItem(ProfileId, ShardId) targets one shard.
+#   - FileType and Country are promoted metadata attributes that also back the vector
+#       index inline filters, so they MUST appear in AttributeDefinitions.
+#
+# Vector index (see design.md "Vector index"):
+#   - NO HASH key in the SearchSchema, so a single SearchVectors call spans ALL actors
+#       and shards (retrieval must range over the whole corpus). A HASH key would force
+#       every search to a single partition value.
+#   - FileType and Country are INLINE_FILTER elements, enabling optional equality
+#       filtering (e.g. "detection shards for Chinese actors") without fragmenting the
+#       search space.
+#   - Attributes used by SearchSchema use SearchSchemaElementType (HASH / INLINE_FILTER),
+#       NOT KeyType.
+#   - Titan Text Embeddings v2 => 1024 dimensions; COSINE distance (lower = more similar).
+#
+# DynamoDB vector indexes are a new capability. The VectorIndexes property shape is
+# inferred from the SearchVectors / CreateTable API. If the CloudFormation resource
+# provider in a region does not yet support VectorIndexes, create the index with the
+# demo's create_table.py approach instead.
+#
+# cfn-lint may report until its spec is updated for vector search (see task 4.2):
+#   - E3002 "VectorIndexes was unexpected" - not yet in the CF spec.
+#   - E3039 AttributeDefinitions / KeySchema mismatch - FileType and Country are used by
+#     the vector index SearchSchema (which cfn-lint cannot see), not the base key.
+# Both are expected and do not indicate a malformed template.
+# ---------------------------------------------------------------------------
+
+Parameters:
+  ContainerImageUri:
+    Type: String
+    Description: >
+      ECR image URI for the agent container
+      (e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/repo:tag).
+
+  BuilderImageUri:
+    Type: String
+    Description: >
+      ECR image URI for the autonomous profile-builder container
+      (e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/repo-builder:tag).
+
+  BedrockModelId:
+    Type: String
+    Default: us.anthropic.claude-sonnet-4-6
+    Description: Bedrock model ID used for answer/enrichment generation (Claude Sonnet).
+
+  AdminEmail:
+    Type: String
+    Default: ""
+    Description: Email address for the initial Cognito admin user (leave empty to skip).
+
+  TableName:
+    Type: String
+    Default: ""
+    Description: Name of the DynamoDB table (leave empty to derive <StackName>-ThreatProfiles).
+
+  VectorIndexName:
+    Type: String
+    Default: profile-embeddings
+    Description: Name of the vector index on the table.
+
+  Dimensions:
+    Type: Number
+    Default: 1024
+    Description: Embedding dimensions. Must match the embedding model (Titan v2 = 1024).
+    MinValue: 1
+    MaxValue: 4096
+
+  DistanceFunction:
+    Type: String
+    Default: COSINE
+    AllowedValues:
+      - COSINE
+      - EUCLIDEAN
+      - DOT_PRODUCT
+    Description: Distance function used by the vector index.
+
+Conditions:
+  HasAdminEmail: !Not [!Equals [!Ref AdminEmail, ""]]
+  HasTableName: !Not [!Equals [!Ref TableName, ""]]
+
+Resources:
+  # ===================================================================
+  # AgentCore Gateway — managed Web Search tool (Req 4.1, 4.2)
+  # ===================================================================
+
+  # Managed policy for the Gateway service role: invoke the gateway itself and
+  # the managed web-search connector (web-search.v1) in this account/region.
+  GatewayServicePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Permissions for the AgentCore Web Search gateway service role.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: InvokeGateway
+            Effect: Allow
+            Action: bedrock-agentcore:InvokeGateway
+            Resource: !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/*"
+          - Sid: InvokeWebSearch
+            Effect: Allow
+            Action: bedrock-agentcore:InvokeWebSearch
+            Resource: !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:aws:tool/web-search.v1"
+
+  GatewayServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-GatewayRole"
+      Description: AgentCore Gateway role for the Web Search connector.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowAgentCoreToAssumeRole
+            Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/*"
+      ManagedPolicyArns:
+        - !Ref GatewayServicePolicy
+
+  # MCP gateway with IAM (SigV4) inbound auth — the agent signs requests with its
+  # runtime role (see AgentCoreRole InvokeGateway statement).
+  WebSearchGateway:
+    Type: AWS::BedrockAgentCore::Gateway
+    Properties:
+      Name: !Sub "${AWS::StackName}-WebSearch"
+      Description: Web Search via AgentCore managed connector.
+      ProtocolType: MCP
+      AuthorizerType: AWS_IAM
+      RoleArn: !GetAtt GatewayServiceRole.Arn
+
+  WebSearchTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Properties:
+      GatewayIdentifier: !GetAtt WebSearchGateway.GatewayIdentifier
+      Name: web-search-tool
+      Description: Built-in Web Search connector.
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+      TargetConfiguration:
+        Mcp:
+          Connector:
+            Source:
+              ConnectorId: web-search
+            Configurations:
+              - Name: WebSearch
+                ParameterValues: {}
+
+  # ===================================================================
+  # AgentCore Runtime execution role
+  # ===================================================================
+
+  AgentCoreRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-AgentCoreRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AgentCorePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ECRAuth
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: ECRPull
+                Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/*"
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/*"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/threat-intel-engine-v2/*"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/threat-intel-engine-v2/*:*"
+              # Bedrock: Claude (generation, via foundation model + inference profile) and
+              # Titan Text Embeddings v2 (query/shard embedding for vector search).
+              - Sid: BedrockModels
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - "arn:aws:bedrock:*::foundation-model/anthropic.*"
+                  - "arn:aws:bedrock:*::foundation-model/amazon.titan-embed-text-v2:0"
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
+              - Sid: InvokeGateway
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:InvokeGateway
+                Resource:
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/${WebSearchGateway.GatewayIdentifier}"
+              # Fire-and-forget invoke of the autonomous profile-builder runtime from the
+              # create_profile HITL tool (async; the main agent does not await the build).
+              - Sid: InvokeBuilderRuntime
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:InvokeAgentRuntime
+                Resource:
+                  - !GetAtt BuilderRuntime.AgentRuntimeArn
+                  - !Sub "${BuilderRuntime.AgentRuntimeArn}/*"
+              # DynamoDB CRUD + Query/Scan for the enrich flow, plus the native
+              # SearchVectors action on the table and its vector index (Req 2).
+              - Sid: DynamoDB
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:SearchVectors
+                Resource:
+                  - !GetAtt ThreatProfilesTable.Arn
+                  - !Sub "${ThreatProfilesTable.Arn}/index/*"
+              - Sid: AgentCoreMemory
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetMemory
+                  - bedrock-agentcore:CreateSession
+                  - bedrock-agentcore:GetSession
+                  - bedrock-agentcore:DeleteSession
+                  - bedrock-agentcore:CreateEvent
+                  - bedrock-agentcore:CreateMemoryEvent
+                  - bedrock-agentcore:ListEvents
+                  - bedrock-agentcore:ListMemoryEvents
+                  - bedrock-agentcore:ListSessions
+                  - bedrock-agentcore:DeleteMemoryEvent
+                  - bedrock-agentcore:DeleteEvent
+                  - bedrock-agentcore:ListMemoryRecords
+                  - bedrock-agentcore:DeleteMemoryRecord
+                  - bedrock-agentcore:RetrieveMemoryRecords
+                  - bedrock-agentcore:RetrieveMemoryInsights
+                Resource:
+                  - !GetAtt AgentCoreMemory.MemoryArn
+                  - !Sub "${AgentCoreMemory.MemoryArn}/*"
+              # Observability: the ADOT/OTEL exporter in the container (task:
+              # observability) delivers traces/spans to X-Ray Transaction Search
+              # and EMF metrics to CloudWatch. These X-Ray/PutMetricData actions
+              # do not support resource-level scoping, so Resource is "*".
+              - Sid: Observability
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutSpansForIndexing
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+              # OTEL spans land in the aws/spans (and application-signals) log
+              # groups, which are outside the CloudWatchLogs statement's scope
+              # above, so grant PutLogEvents there explicitly.
+              - Sid: ObservabilitySpanLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans:*"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/application-signals/data:*"
+
+  # ===================================================================
+  # AgentCore Runtime (Req 8.3 — CustomJWTAuthorizer against Cognito)
+  # ===================================================================
+
+  ThreatIntelAgentRuntime:
+    Type: AWS::BedrockAgentCore::Runtime
+    Properties:
+      AgentRuntimeName: !Sub "${AWS::StackName}_ThreatIntelAgent"
+      Description: Threat intelligence RAG agent (DynamoDB vector search + web search + HITL enrichment).
+      RoleArn: !GetAtt AgentCoreRole.Arn
+      AgentRuntimeArtifact:
+        ContainerConfiguration:
+          ContainerUri: !Ref ContainerImageUri
+      NetworkConfiguration:
+        NetworkMode: PUBLIC
+      AuthorizerConfiguration:
+        CustomJWTAuthorizer:
+          DiscoveryUrl: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}/.well-known/openid-configuration"
+          AllowedClients:
+            - !Ref UserPoolClient
+      EnvironmentVariables:
+        AWS_REGION: !Ref AWS::Region
+        AWS_DEFAULT_REGION: !Ref AWS::Region
+        LOG_LEVEL: INFO
+        # The v2 agent config (agent/src/config.py) reads MODEL_ID, not BEDROCK_MODEL_ID.
+        MODEL_ID: !Ref BedrockModelId
+        DDB_TABLE_NAME: !Ref ThreatProfilesTable
+        DDB_VECTOR_INDEX: !Ref VectorIndexName
+        EMBEDDING_MODEL: amazon.titan-embed-text-v2:0
+        EMBEDDING_DIMENSIONS: !Ref Dimensions
+        AGENTCORE_GATEWAY_URL: !GetAtt WebSearchGateway.GatewayUrl
+        AGENTCORE_MEMORY_ID: !GetAtt AgentCoreMemory.MemoryId
+        # ARN of the autonomous builder runtime, fire-and-forget invoked by create_profile.
+        BUILDER_RUNTIME_ARN: !GetAtt BuilderRuntime.AgentRuntimeArn
+
+  # ===================================================================
+  # Profile builder — autonomous runtime + role + failure SNS topic
+  # (create-new-profile feature; see docs/CREATE_PROFILE_DESIGN.md)
+  # ===================================================================
+
+  # SNS topic for out-of-band builder failure alerts. The build runs fire-and-forget, so
+  # the user is not notified in-band; failures publish here for the operator. When an
+  # AdminEmail is provided it is subscribed automatically.
+  ProfileBuildFailureTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-profile-build-failures"
+      DisplayName: Threat Intel profile build failures
+
+  ProfileBuildFailureSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAdminEmail
+    Properties:
+      TopicArn: !Ref ProfileBuildFailureTopic
+      Protocol: email
+      Endpoint: !Ref AdminEmail
+
+  # Execution role for the builder runtime. Like AgentCoreRole it pulls its image, writes
+  # logs + OTEL spans, invokes Bedrock (Claude + Titan) and the web-search gateway, and
+  # reads/writes the table (Scan/Query/GetItem for the dedup re-check + BatchWriteItem for
+  # the atomic profile write, plus SearchVectors for the semantic dedup). It also publishes
+  # to the failure SNS topic. It does NOT touch Memory (the builder is stateless).
+  BuilderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-BuilderRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BuilderPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ECRAuth
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: ECRPull
+                Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/*"
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/*"
+              - Sid: BedrockModels
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - "arn:aws:bedrock:*::foundation-model/anthropic.*"
+                  - "arn:aws:bedrock:*::foundation-model/amazon.titan-embed-text-v2:0"
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
+              - Sid: InvokeGateway
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:InvokeGateway
+                Resource:
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/${WebSearchGateway.GatewayIdentifier}"
+              - Sid: DynamoDB
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:PutItem
+                  - dynamodb:SearchVectors
+                Resource:
+                  - !GetAtt ThreatProfilesTable.Arn
+                  - !Sub "${ThreatProfilesTable.Arn}/index/*"
+              - Sid: PublishFailures
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Ref ProfileBuildFailureTopic
+              - Sid: Observability
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutSpansForIndexing
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+              - Sid: ObservabilitySpanLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans:*"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/application-signals/data:*"
+
+  # The autonomous builder runtime. No JWT authorizer: it is invoked machine-to-machine
+  # (SigV4/IAM) by the main runtime's create_profile tool, never directly by a browser.
+  BuilderRuntime:
+    Type: AWS::BedrockAgentCore::Runtime
+    Properties:
+      AgentRuntimeName: !Sub "${AWS::StackName}_ProfileBuilder"
+      Description: Autonomous threat-profile builder (research + generate 12 sections + embed + write).
+      RoleArn: !GetAtt BuilderRole.Arn
+      AgentRuntimeArtifact:
+        ContainerConfiguration:
+          ContainerUri: !Ref BuilderImageUri
+      NetworkConfiguration:
+        NetworkMode: PUBLIC
+      EnvironmentVariables:
+        AWS_REGION: !Ref AWS::Region
+        AWS_DEFAULT_REGION: !Ref AWS::Region
+        LOG_LEVEL: INFO
+        MODEL_ID: !Ref BedrockModelId
+        DDB_TABLE_NAME: !Ref ThreatProfilesTable
+        DDB_VECTOR_INDEX: !Ref VectorIndexName
+        EMBEDDING_MODEL: amazon.titan-embed-text-v2:0
+        EMBEDDING_DIMENSIONS: !Ref Dimensions
+        AGENTCORE_GATEWAY_URL: !GetAtt WebSearchGateway.GatewayUrl
+        FAILURE_SNS_TOPIC_ARN: !Ref ProfileBuildFailureTopic
+
+  # ===================================================================
+  # AgentCore Memory (Req 8.5)
+  # ===================================================================
+  #
+  # NamespaceTemplates align with the retrieval namespaces used by the agent's
+  # get_session_manager (agent/src/agentcore_app.py, task 10):
+  #   Semantic       -> /threat-intel/facts        (static prefix; {actorId} scopes per analyst)
+  #   Summary        -> /summaries/{sessionId}      (rolling per-session summary)
+  #   UserPreference -> /users/preferences          (static prefix; {actorId} scopes per analyst)
+  # The Summary namespace embeds {sessionId} exactly as the agent substitutes it at
+  # retrieval time; Semantic/UserPreference keep the static prefixes the agent uses.
+  AgentCoreMemory:
+    Type: AWS::BedrockAgentCore::Memory
+    Properties:
+      # Memory Name must match ^[a-zA-Z][a-zA-Z0-9_]{0,47}$ (letters/digits/underscore
+      # only, must start with a letter — NO hyphens). StackName commonly contains
+      # hyphens, so we build a stack-unique name from the "Memory" prefix + the first
+      # 8-hex-char segment of the stack GUID (hyphen-free) joined with an underscore.
+      Name: !Join
+        - "_"
+        - - Memory
+          - !Select [0, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+      Description: Conversation memory for threat-intel agent sessions.
+      EventExpiryDuration: 90
+      MemoryStrategies:
+        - SemanticMemoryStrategy:
+            Name: ThreatFactExtractor
+            NamespaceTemplates:
+              - "/threat-intel/facts/{actorId}"
+        - SummaryMemoryStrategy:
+            Name: SessionSummarizer
+            NamespaceTemplates:
+              - "/summaries/{sessionId}"
+        - UserPreferenceMemoryStrategy:
+            Name: PreferenceLearner
+            NamespaceTemplates:
+              - "/users/preferences/{actorId}"
+
+  # ===================================================================
+  # Cognito (admin-only user creation; MFA disabled — see UserPool note) — Req 8.3
+  # ===================================================================
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${AWS::StackName}-users"
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      # MFA is disabled: EMAIL_OTP MFA requires a verified SES identity
+      # (EmailSendingAccount: DEVELOPER), which this demo intentionally avoids.
+      # Admins can enable SES + EMAIL_OTP later.
+      MfaConfiguration: "OFF"
+      # Use Cognito's built-in email sender so the stack does not require a verified
+      # SES identity to deploy (sends admin-invite / verification emails).
+      EmailConfiguration:
+        EmailSendingAccount: COGNITO_DEFAULT
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Join ["-", ["ti", !Ref "AWS::AccountId", !Select [0, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]]]
+      UserPoolId: !Ref UserPool
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${AWS::StackName}-frontend"
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+      SupportedIdentityProviders:
+        - COGNITO
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - profile
+      CallbackURLs:
+        - http://localhost:5173/callback
+      LogoutURLs:
+        - http://localhost:5173
+
+  AdminUser:
+    Type: AWS::Cognito::UserPoolUser
+    Condition: HasAdminEmail
+    Properties:
+      UserPoolId: !Ref UserPool
+      Username: !Ref AdminEmail
+      UserAttributes:
+        - Name: email
+          Value: !Ref AdminEmail
+        - Name: email_verified
+          Value: "true"
+      DesiredDeliveryMediums:
+        - EMAIL
+
+  # ===================================================================
+  # Frontend Hosting (S3 + CloudFront, SPA) — Req 8.1
+  # ===================================================================
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Join ["-", ["ti-fe", !Ref "AWS::AccountId", !Select [0, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]]]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    # Ordering vs. CloudFrontDistribution is already enforced by the Sub/Ref to the
+    # distribution ID in the policy condition below (no explicit DependsOn needed).
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !Ref CloudFrontOAC
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          ForwardedValues:
+            QueryString: false
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+
+  # ===================================================================
+  # DynamoDB vector table (task 4) — unchanged
+  # ===================================================================
+
+  ThreatProfilesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !If [HasTableName, !Ref TableName, !Sub "${AWS::StackName}-ThreatProfiles"]
+      # PAY_PER_REQUEST is required for vector indexes.
+      BillingMode: PAY_PER_REQUEST
+      # Base-table primary key: actor id (HASH) + shard file_type (RANGE).
+      AttributeDefinitions:
+        - AttributeName: ProfileId
+          AttributeType: S
+        - AttributeName: ShardId
+          AttributeType: S
+        # Attributes referenced by the vector index SearchSchema must be declared here.
+        - AttributeName: FileType
+          AttributeType: S
+        - AttributeName: Country
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ProfileId
+          KeyType: HASH
+        - AttributeName: ShardId
+          KeyType: RANGE
+      # ---- Vector index (new capability) ----
+      # Inferred from the SearchVectors / CreateTable snippets:
+      #   VectorIndexes: [ { IndexName, VectorAttribute, SearchSchema[], Projection, Dimensions, DistanceFunction } ]
+      VectorIndexes:
+        - IndexName: !Ref VectorIndexName
+          # The item attribute holding the embedding (list of Float32).
+          VectorAttribute:
+            AttributeName: Embedding
+          # INLINE_FILTER attributes are applied during graph traversal and must appear
+          # in AttributeDefinitions. No HASH key -> searches span all items.
+          SearchSchema:
+            - AttributeName: FileType
+              SearchSchemaElementType: INLINE_FILTER
+            - AttributeName: Country
+              SearchSchemaElementType: INLINE_FILTER
+          Projection:
+            ProjectionType: ALL
+          Dimensions: !Ref Dimensions
+          DistanceFunction: !Ref DistanceFunction
+      Tags:
+        - Key: Project
+          Value: ThreatIntelEngineV2
+        - Key: Component
+          Value: VectorStore
+
+Outputs:
+  RuntimeId:
+    Description: AgentCore Runtime ID.
+    Value: !GetAtt ThreatIntelAgentRuntime.AgentRuntimeId
+  RuntimeArn:
+    Description: AgentCore Runtime ARN.
+    Value: !GetAtt ThreatIntelAgentRuntime.AgentRuntimeArn
+
+  BuilderRuntimeArn:
+    Description: Autonomous profile-builder AgentCore Runtime ARN.
+    Value: !GetAtt BuilderRuntime.AgentRuntimeArn
+
+  ProfileBuildFailureTopicArn:
+    Description: SNS topic ARN for profile-build failure alerts.
+    Value: !Ref ProfileBuildFailureTopic
+  GatewayUrl:
+    Description: AgentCore Gateway MCP endpoint URL (Web Search).
+    Value: !GetAtt WebSearchGateway.GatewayUrl
+  GatewayId:
+    Description: AgentCore Gateway identifier.
+    Value: !GetAtt WebSearchGateway.GatewayIdentifier
+  UserPoolId:
+    Description: Cognito User Pool ID.
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Description: Cognito App Client ID.
+    Value: !Ref UserPoolClient
+  CognitoDomain:
+    Description: Cognito Hosted UI domain prefix.
+    Value: !Join ["-", ["ti", !Ref "AWS::AccountId", !Select [0, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]]]
+  CloudFrontDomain:
+    Description: CloudFront distribution domain name.
+    Value: !GetAtt CloudFrontDistribution.DomainName
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID.
+    Value: !Ref CloudFrontDistribution
+  FrontendBucketName:
+    Description: S3 bucket for frontend assets.
+    Value: !Ref FrontendBucket
+  MemoryId:
+    Description: AgentCore Memory ID.
+    Value: !GetAtt AgentCoreMemory.MemoryId
+  TableName:
+    Description: Name of the created DynamoDB table.
+    Value: !Ref ThreatProfilesTable
+  TableArn:
+    Description: ARN of the created DynamoDB table.
+    Value: !GetAtt ThreatProfilesTable.Arn
+  VectorIndexName:
+    Description: Name of the vector index.
+    Value: !Ref VectorIndexName

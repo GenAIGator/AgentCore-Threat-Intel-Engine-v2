@@ -1,0 +1,25 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Node / frontend
+node_modules/
+dist/
+
+# Local env / deploy artifacts (real values written by deploy.sh — never commit)
+.env
+frontend/.env
+agent/.env
+builder/.env
+
+# Scratch / logs
+temp/
+*.log
+
+# OS
+.DS_Store

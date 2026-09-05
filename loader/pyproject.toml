@@ -1,0 +1,39 @@
+[project]
+name = "threat-intel-engine-v2-loader"
+version = "0.1.0"
+description = "Threat Intelligence Engine v2 — ingestion loader and content derivation"
+requires-python = ">=3.12"
+dependencies = [
+    "boto3~=1.43",
+]
+
+[dependency-groups]
+dev = [
+    "pytest~=9.1",
+    "ruff~=0.15",
+    "mypy~=2.3",
+    "black~=26.5",
+]
+
+[tool.uv]
+package = false
+
+[tool.black]
+line-length = 100
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]

@@ -1,0 +1,7 @@
+# Vendored shared modules — single source of truth lives in ../agent/src and ../loader.
+# Copied here for local dev/tests; the Dockerfile COPYs them at image build time.
+# Do not edit these copies; edit the originals.
+profile_dedup.py
+ddb.py
+embeddings.py
+content.py

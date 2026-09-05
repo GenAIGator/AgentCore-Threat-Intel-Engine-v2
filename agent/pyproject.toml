@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "threat-intel-engine-v2-agent"
+version = "0.1.0"
+description = "Threat Intelligence Engine v2 — Strands agent on Bedrock AgentCore with DynamoDB vector search"
+requires-python = ">=3.12"
+dependencies = [
+    "strands-agents[otel]~=1.48",
+    "strands-agents-tools~=0.8",
+    "bedrock-agentcore[strands-agents]~=1.18",
+    "mcp-proxy-for-aws>=0.1.0",
+    "boto3~=1.43",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "aws-opentelemetry-distro>=0.10.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest~=9.1",
+    "ruff~=0.15",
+    "mypy~=2.3",
+    "black~=26.5",
+    "boto3-stubs[dynamodb,bedrock-runtime]~=1.43",
+]
+
+[tool.uv]
+required-version = ">=0.11.0"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.black]
+line-length = 100
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+mypy_path = "src"
+explicit_package_bases = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
