@@ -42,18 +42,114 @@ store could be swapped with limited blast radius.
 
 ## ADR-2: One embedding per shard, composite key `(ProfileId, ShardId)`
 
-**Decision.** Each `file_type` shard is its own item and its own embedding; the actor id is
-the partition key and the shard/`file_type` is the sort key.
+**Decision.** Each `file_type` shard is its own DynamoDB item and its own embedding; the
+actor id is the partition key (`ProfileId`) and the shard/`file_type` is the sort key
+(`ShardId`). Actor/section identity lives in first-class item **attributes**
+(`ProfileId`, `Name`, `FileType`, `ShardId`) — separate from the embedded `Content` — so
+every item self-identifies at retrieval time regardless of what its text says.
 
-**Why.**
-- **Retrieval precision:** a query about detection matches the `detection` shard, not a
-  diluted per-actor blob. (v1 already embeds per-shard via `ChunkingStrategy: NONE`.)
-- **Operational access:** `Query(ProfileId)` fetches a whole actor for the enrich flow;
+### Why
+
+- **Retrieval precision.** A query about detection matches the detection shard, not a
+  diluted per-actor blob. (v1 already embeds per-shard: the corpus is pre-chunked into
+  one file per `file_type`, i.e. the file *is* the chunk.)
+- **Operational access.** `Query(ProfileId)` fetches a whole actor for the enrich flow;
   `GetItem(ProfileId, ShardId)` targets one shard to update.
-- **Titan token limits:** avoids truncating a concatenated per-actor document.
+- **Titan token limits.** Avoids truncating a concatenated per-actor document before it's
+  embedded.
 
-**Trade-off:** more items (~1630) and more embedding calls at load time. Acceptable for a
-one-time seed; the production alternative (Streams→Lambda auto-embed) is documented but not built.
+**Trade-off.** More items (~1,630 seed shards) and more embedding calls at load time.
+Acceptable for a one-time seed; the production alternative (DynamoDB Streams → Lambda
+auto-embed) is documented but not built.
+
+### Chunking — current approach and a known limitation
+
+Today each shard is embedded as a single fixed, non-split chunk — one `file_type` shard →
+one `Content` string → one embedding. This is inherited from v1's S3 Vectors design,
+which pre-chunked the corpus into per-`file_type` files (the file is the chunk). It works
+well for the **seed** corpus because those shards were authored to a bounded size
+(~500 characters each).
+
+That assumption breaks down for the **richer, generated** content v2 now produces:
+`enrich_profile` rewrites a shard from web research, and `create_profile` generates all
+12 sections from scratch. A generated section can be far longer than a hand-authored seed
+shard (observed: ~6,000–6,500 characters vs. ~500), so embedding it as one chunk risks:
+
+- **Diluted embeddings** — a single vector averaged over a long, multi-topic section
+  retrieves less precisely than several focused vectors would; and
+- **Token-limit pressure** — a long enough section approaches Titan's input limit, where
+  content would be truncated before it's embedded.
+
+### Recommended evolution (not yet built)
+
+Move from fixed whole-shard chunks to a **size-aware splitting strategy for large
+shards**: split an over-length section into multiple sub-chunks, embed each, and store
+them as sibling items under the same `ProfileId`, extending `ShardId` with a zero-padded
+suffix (`detection#01`, `detection#02`, …).
+
+**How to split (dispatch by field shape):**
+
+- **List / dict fields** (most sections — e.g. `detection_opportunities`, `tooling`,
+  `common_tactics`) — split on field / list-item boundaries, packing whole items to a
+  target size (~1,000–1,500 characters). Never cut a list item; no overlap needed.
+- **Free-text prose fields** (only `description`, `summary`) — split on sentence
+  boundaries with a small (~1 sentence) overlap so a fact spanning a boundary isn't lost.
+
+**Example layout:**
+
+```
+ProfileId   ShardId          FileType      Content (embedded)
+team_pcp    detection#01     detection     <sub-topic 1, ~1,200 ch>
+team_pcp    detection#02     detection     <sub-topic 2, ~1,200 ch>
+team_pcp    detection#03     detection     <sub-topic 3, ~1,200 ch>
+```
+
+Notes:
+
+- **`FileType` stays the bare section name** (`detection`) on every sub-chunk, so the
+  existing `FileType` inline filter still scopes a whole section without change.
+- **Zero-pad the suffix** (`#01`, not `#1`) so sort order stays correct past nine
+  sub-chunks.
+- **Reuse the existing `derive_content` formatter** on each sub-shard so sub-chunk text
+  is formatted identically to today's shards (stable, idempotent embeddings).
+
+**Optional — per-section summary chunk.** A short summary of the section MAY also be
+embedded as `detection#00` (uniformly suffixed, ahead of the detail chunks). It serves
+high-level queries ("what is this actor's detection posture?") while the `#01…#NN` chunks
+serve specific ones — a lightweight two-tier (overview vs. detail) retrieval layer. This
+is optional; the core decision above works without it.
+
+**Considered lighter alternative — summary-embed.** Instead of splitting, embed a concise
+generated summary as `Content` and keep the full section text in a **non-embedded**
+`Body` attribute for display. This fixes the dilution problem with no split/reassembly
+machinery, at the cost of matching on the summary rather than the exact sentence. For a
+small, mostly-static corpus this may be the better ROI; sub-chunk splitting is warranted
+when paragraph-level retrieval precision is needed.
+
+### Impact on retrieval
+
+- **Query path: unchanged.** Retrieval already spans all shards (no HASH key, ADR-3) and
+  ranks by distance, so multiple sub-chunks per section slot in with no change to the
+  `SearchVectors` call, index, or inline filters.
+- **Presentation: a small change.** Project `ShardId` and group multiple sub-chunk hits
+  under one `ProfileId / FileType` heading so the model sees one coherent section rather
+  than scattered `detection#01`, `detection#02` entries. Optionally, if any sub-chunk of a
+  section ranks, expand to the full section via
+  `Query(ProfileId, begins_with(ShardId, "detection"))` — precise matching, complete
+  context ("small-to-big" retrieval).
+- **Association is preserved for free.** Each sub-chunk is still its own item carrying
+  `ProfileId` / `Name` / `FileType`, so a hit always knows which actor and section it
+  belongs to — the split never risks losing attribution.
+
+**Ownership.** The `enrich_profile` / `create_profile` writers own the split-and-embed
+step; the loader/seed path is unaffected (seed shards stay seed-sized and need no
+splitting).
+
+### No infrastructure change required
+
+All of the above stays within the current `(ProfileId, ShardId)` table and the existing
+`FileType` inline filter — no CloudFormation or vector-index change is needed for either
+the sub-chunk or summary-embed approach.
 
 ## ADR-3: No HASH key on the vector index
 

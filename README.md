@@ -70,6 +70,27 @@ back to the UI. The agent's tools:
   background. See [`docs/CREATE_PROFILE_DESIGN.md`](./docs/CREATE_PROFILE_DESIGN.md).
 - **`current_time`** — a small utility tool for time-relative reasoning.
 
+### Tools at a glance
+
+There are two Strands agents — the interactive **main agent** and the autonomous **builder
+runtime** — and only one tool is exposed over MCP. Everything else is a local `@tool` that may
+call AWS directly (DynamoDB, or invoking the builder runtime) but does **not** go through MCP.
+
+| Tool | Runtime | Exposed via | What it does |
+|---|---|---|---|
+| `retrieve_profiles` | main | local `@tool` | Embed the query, run DynamoDB `SearchVectors`, return grounding context |
+| `enrich_profile` | main | local `@tool` (HITL) | Research + draft a shard update; write back and re-embed on approval |
+| `create_profile` | main | local `@tool` (HITL) | Dedup-check a new actor, then fire-and-forget invoke the builder runtime |
+| `clear_all_memory` | main | local `@tool` (HITL) | Wipe all short/long-term memory, then auto-restart the session |
+| `current_time` | main | local (`strands_tools`) | Time utility for time-relative reasoning |
+| `WebSearch` | main **and** builder | **MCP** (AgentCore Gateway) | AWS-managed web-search connector |
+
+**`WebSearch` is the only MCP tool** in the system — both runtimes reach it through the same
+IAM-authed AgentCore Gateway (see [Web search via AgentCore Gateway](#web-search-via-agentcore-gateway-mcp)).
+The builder runtime carries *only* `WebSearch`; it researches each of the 12 sections and
+writes the profile directly. (**AgentCore Memory** is used by the main agent but is a session
+manager, not a tool and not MCP.)
+
 Conversation continuity is backed by **AgentCore Memory** (short-term history plus
 long-term facts and preferences). The agent is cached per session in-process so the same
 instance that raised a HITL interrupt handles the approve/reject resume.
